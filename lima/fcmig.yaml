@@ -1,0 +1,46 @@
+# Linux host for the Firecracker live-migration demo.
+#
+# Firecracker needs KVM, which macOS does not have. Apple Silicon (M3 or
+# newer) on macOS 15+ supports nested virtualization, so we run a Linux VM
+# through Lima's Virtualization.framework backend and get a working /dev/kvm
+# inside it. The two "physical hosts" of the demo are Docker containers in
+# this VM, each with access to /dev/kvm.
+#
+#   limactl start --name=fcmig lima/fcmig.yaml
+vmType: vz
+nestedVirtualization: true
+
+cpus: 8
+memory: 8GiB
+disk: 40GiB
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/noble/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: aarch64
+
+mounts:
+  - location: "~/fc-live-migration"
+    writable: true
+
+provision:
+  # Docker (the two demo "hosts"), toolchain for the rootfs image, gnuplot
+  # for the benchmark histogram.
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y --no-install-recommends \
+        docker.io docker-compose-v2 git make curl ca-certificates \
+        build-essential musl-tools e2fsprogs busybox-static gnuplot-nox
+      usermod -aG docker "{{.User}}"
+  # Rust toolchain to build Firecracker from source (version pinned by the
+  # firecracker repo's own rust-toolchain.toml).
+  - mode: user
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      command -v "$HOME/.cargo/bin/cargo" >/dev/null 2>&1 && exit 0
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal

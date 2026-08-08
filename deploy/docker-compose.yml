@@ -1,0 +1,83 @@
+# Two migration hosts + a measurement client on one L2 segment.
+#
+# host-a/host-b are the "physical hosts": each gets /dev/kvm (nested KVM from
+# the Lima VM), /dev/net/tun + NET_ADMIN for the guest bridge, a private
+# tmpfs for snapshot files (RAM-speed writes in the migration hot path), and
+# /srv/fcmig — the shared-storage stand-in (a cluster's NFS/SAN) holding the
+# guest's kernel and root disk, so migration moves no disk data.
+#
+# Deliberately NOT privileged: the exact device nodes and the one capability
+# the hosts need, nothing more.
+name: fcmig
+
+x-host: &host
+  build:
+    context: .
+    dockerfile: Dockerfile.host
+  devices:
+    - /dev/kvm
+    - /dev/net/tun
+  cap_add:
+    - NET_ADMIN
+  security_opt:
+    - no-new-privileges:true
+  volumes:
+    - ../build:/opt/fcmig:ro
+    - /srv/fcmig:/srv/vmstore
+  tmpfs:
+    - /run/fcmig:size=1g
+  command: ["-live-rounds=${LIVE_ROUNDS:-true}"]
+
+services:
+  host-a:
+    <<: *host
+    hostname: host-a
+    environment:
+      AGENT_NAME: host-a
+    networks:
+      mignet:
+        ipv4_address: 172.30.0.11   # guest data-plane L2
+      xfernet:
+        ipv4_address: 172.31.0.11   # dedicated migration network
+
+  host-b:
+    <<: *host
+    hostname: host-b
+    environment:
+      AGENT_NAME: host-b
+    networks:
+      mignet:
+        ipv4_address: 172.30.0.12
+      xfernet:
+        ipv4_address: 172.31.0.12
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile.host
+    hostname: client
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - ../build:/opt/fcmig:ro
+      - ../bench-results:/bench-results
+    networks:
+      # Client lives only on the guest L2 — it measures what a real user of
+      # the guest would see, with no visibility into the migration network.
+      mignet:
+        ipv4_address: 172.30.0.20
+
+networks:
+  mignet:
+    driver: bridge
+    ipam:
+      config:
+        # .11/.12/.20 are the containers above; .50 is the guest itself,
+        # attached to this same L2 through the host containers' bridges.
+        - subnet: 172.30.0.0/24
+          gateway: 172.30.0.1
+  xfernet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+          gateway: 172.31.0.1
