@@ -1,0 +1,651 @@
+From 1bc72eb9f2a86cbd8770b5f95f60e71837f5b284 Mon Sep 17 00:00:00 2001
+From: Laksh Goyal <laksh.g@gmicloud.ai>
+Date: Fri, 31 Jul 2026 02:42:59 -0700
+Subject: [PATCH] vmm: add DiffLive snapshot type for live migration pre-copy
+
+Firecracker snapshots require paused vCPUs because the vCPU/device state
+save is only valid when stopped. The guest-memory dump has no such
+requirement, so this adds SnapshotType::DiffLive: a diff snapshot that dumps
+dirty guest memory while the vCPUs keep running, skipping the state save
+entirely (a live-migration pre-copy round).
+
+Correctness rests on two properties. Guest writes racing the dump are
+handled by KVM's fetch-and-clear dirty log: a racing write is either in the
+bitmap already fetched (its page is dumped, possibly torn) or in KVM's fresh
+bitmap (re-dumped next round), so torn pages are always re-marked dirty.
+VMM-side writes (virtio) cannot race the dump because device emulation runs
+on the same thread. A live dump therefore preserves the VMM-internal dirty
+bitmap rather than resetting it; only a final paused Diff resets.
+
+To bound how long one call occupies the VMM event loop (which also services
+virtio), live_max_bytes caps the dump. Over-budget dirty pages are recorded
+back into the VMM dirty bitmap, which then acts as the drain backlog: each
+subsequent round fetches KVM's log again, ORs in that backlog, ships another
+budget's worth, and re-records the rest, so the residual shrinks whenever the
+guest dirties less than a budget per round. dirty_backlog_bytes() exposes the
+backlog size for observability.
+
+Adds unit tests for the drain, the budget split, and backlog accounting;
+swagger and API metrics updated. No change to Full or Diff behavior.
+---
+ src/firecracker/src/api_server/mod.rs         |   6 +
+ .../src/api_server/request/snapshot.rs        |   2 +
+ src/firecracker/swagger/firecracker.yaml      |  13 +-
+ src/vmm/src/persist.rs                        |  28 +-
+ src/vmm/src/rpc_interface.rs                  |  13 +-
+ src/vmm/src/vmm_config/snapshot.rs            |  14 +
+ src/vmm/src/vstate/memory.rs                  | 289 ++++++++++++++++--
+ src/vmm/src/vstate/vm.rs                      |  24 ++
+ src/vmm/tests/integration_tests.rs            |   1 +
+ 9 files changed, 360 insertions(+), 30 deletions(-)
+
+diff --git a/src/firecracker/src/api_server/mod.rs b/src/firecracker/src/api_server/mod.rs
+index ecc6a72..5d9d1d3 100644
+--- a/src/firecracker/src/api_server/mod.rs
++++ b/src/firecracker/src/api_server/mod.rs
+@@ -159,6 +159,10 @@ impl ApiServer {
+                     &METRICS.latencies_us.diff_create_snapshot,
+                     "create diff snapshot",
+                 )),
++                SnapshotType::DiffLive => Some((
++                    &METRICS.latencies_us.diff_create_snapshot,
++                    "create live diff snapshot",
++                )),
+             },
+             VmmAction::LoadSnapshot(_) => {
+                 Some((&METRICS.latencies_us.load_snapshot, "load snapshot"))
+@@ -277,6 +281,7 @@ mod tests {
+                 snapshot_type: SnapshotType::Diff,
+                 snapshot_path: PathBuf::new(),
+                 mem_file_path: PathBuf::new(),
++                live_max_bytes: None,
+             })),
+             start_time_us,
+         );
+@@ -290,6 +295,7 @@ mod tests {
+                 snapshot_type: SnapshotType::Diff,
+                 snapshot_path: PathBuf::new(),
+                 mem_file_path: PathBuf::new(),
++                live_max_bytes: None,
+             })),
+             start_time_us,
+         );
+diff --git a/src/firecracker/src/api_server/request/snapshot.rs b/src/firecracker/src/api_server/request/snapshot.rs
+index e6640ac..a12b174 100644
+--- a/src/firecracker/src/api_server/request/snapshot.rs
++++ b/src/firecracker/src/api_server/request/snapshot.rs
+@@ -147,6 +147,7 @@ mod tests {
+             snapshot_type: SnapshotType::Diff,
+             snapshot_path: PathBuf::from("foo"),
+             mem_file_path: PathBuf::from("bar"),
++            live_max_bytes: None,
+         };
+         assert_eq!(
+             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
+@@ -161,6 +162,7 @@ mod tests {
+             snapshot_type: SnapshotType::Full,
+             snapshot_path: PathBuf::from("foo"),
+             mem_file_path: PathBuf::from("bar"),
++            live_max_bytes: None,
+         };
+         assert_eq!(
+             vmm_action_from_request(parse_put_snapshot(&Body::new(body), Some("create")).unwrap()),
+diff --git a/src/firecracker/swagger/firecracker.yaml b/src/firecracker/swagger/firecracker.yaml
+index e988218..067a0bc 100644
+--- a/src/firecracker/swagger/firecracker.yaml
++++ b/src/firecracker/swagger/firecracker.yaml
+@@ -1621,9 +1621,20 @@ definitions:
+         enum:
+           - Full
+           - Diff
++          - DiffLive
+         description:
+           Type of snapshot to create. It is optional and by default, a full
+-          snapshot is created.
++          snapshot is created. DiffLive dumps only guest memory dirtied since
++          the previous snapshot, without pausing the vCPUs (a live-migration
++          pre-copy round); it writes no vCPU/device state and requires
++          track_dirty_pages.
++      live_max_bytes:
++        type: integer
++        format: int64
++        description:
++          DiffLive only. Cap on how many bytes of guest memory this call may
++          dump; dirty pages beyond the cap stay marked dirty for subsequent
++          calls. Bounds how long one call occupies the VMM event loop.
+ 
+   NetworkOverride:
+     type: object
+diff --git a/src/vmm/src/persist.rs b/src/vmm/src/persist.rs
+index feb53c0..8701153 100644
+--- a/src/vmm/src/persist.rs
++++ b/src/vmm/src/persist.rs
+@@ -34,7 +34,9 @@ use crate::utils::u64_to_usize;
+ use crate::vmm_config::boot_source::BootSourceConfig;
+ use crate::vmm_config::instance_info::InstanceInfo;
+ use crate::vmm_config::machine_config::{HugePageConfig, MachineConfigError, MachineConfigUpdate};
+-use crate::vmm_config::snapshot::{CreateSnapshotParams, LoadSnapshotParams, MemBackendType};
++use crate::vmm_config::snapshot::{
++    CreateSnapshotParams, LoadSnapshotParams, MemBackendType, SnapshotType,
++};
+ use crate::vstate::kvm::KvmState;
+ use crate::vstate::memory::{
+     self, GuestMemoryState, GuestRegionMmap, GuestRegionType, MemoryError,
+@@ -147,6 +149,8 @@ pub enum MicrovmStateError {
+ pub enum CreateSnapshotError {
+     /// Cannot get dirty bitmap: {0}
+     DirtyBitmap(#[from] VmError),
++    /// Live diff snapshots require dirty page tracking to be enabled
++    DirtyPageTrackingRequired,
+     /// Cannot write memory file: {0}
+     Memory(#[from] MemoryError),
+     /// Cannot perform {0} on the memory backing file: {1}
+@@ -168,18 +172,28 @@ pub fn create_snapshot(
+     vm_info: &VmInfo,
+     params: &CreateSnapshotParams,
+ ) -> Result<(), CreateSnapshotError> {
+-    let microvm_state = vmm
+-        .save_state(vm_info)
+-        .map_err(CreateSnapshotError::MicrovmState)?;
+-
+-    snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
++    // A live diff dumps guest memory while the vCPUs keep running. The
++    // vCPU/device state can only be captured from a paused VM, and is only
++    // needed by the final (paused) pass of a migration, so it is skipped
++    // here — this is precisely what makes the round pause-free.
++    if params.snapshot_type != SnapshotType::DiffLive {
++        let microvm_state = vmm
++            .save_state(vm_info)
++            .map_err(CreateSnapshotError::MicrovmState)?;
++
++        snapshot_state_to_file(&microvm_state, &params.snapshot_path)?;
++    }
+ 
+     let kvm_vm = vmm.vm.as_kvm().ok_or_else(|| {
+         CreateSnapshotError::MicrovmState(MicrovmStateError::NotAllowed(
+             "snapshot requires KVM".into(),
+         ))
+     })?;
+-    kvm_vm.snapshot_memory_to_file(&params.mem_file_path, params.snapshot_type)?;
++    kvm_vm.snapshot_memory_to_file(
++        &params.mem_file_path,
++        params.snapshot_type,
++        params.live_max_bytes,
++    )?;
+ 
+     // We need to mark queues as dirty again for all activated devices. The reason we
+     // do it here is that we don't mark pages as dirty during runtime
+diff --git a/src/vmm/src/rpc_interface.rs b/src/vmm/src/rpc_interface.rs
+index 7693b30..735fe35 100644
+--- a/src/vmm/src/rpc_interface.rs
++++ b/src/vmm/src/rpc_interface.rs
+@@ -924,6 +924,9 @@ impl RuntimeApiController {
+         if create_params.snapshot_type == SnapshotType::Diff {
+             log_dev_preview_warning("Virtual machine diff snapshots", None);
+         }
++        if create_params.snapshot_type == SnapshotType::DiffLive {
++            log_dev_preview_warning("Live (non-pausing) diff snapshots", None);
++        }
+ 
+         let mut locked_vmm = self.vmm.lock().unwrap();
+         let vm_info = VmInfo::from(&*locked_vmm);
+@@ -942,13 +945,18 @@ impl RuntimeApiController {
+                     elapsed_time_us
+                 );
+             }
+-            SnapshotType::Diff => {
++            SnapshotType::Diff | SnapshotType::DiffLive => {
+                 let elapsed_time_us = update_metric_with_elapsed_time(
+                     &METRICS.latencies_us.vmm_diff_create_snapshot,
+                     create_start_us,
+                 );
+                 info!(
+-                    "'create diff snapshot' VMM action took {} us.",
++                    "'create {} snapshot' VMM action took {} us.",
++                    if create_params.snapshot_type == SnapshotType::Diff {
++                        "diff"
++                    } else {
++                        "live diff"
++                    },
+                     elapsed_time_us
+                 );
+             }
+@@ -1240,6 +1248,7 @@ mod tests {
+                 snapshot_type: SnapshotType::Full,
+                 snapshot_path: PathBuf::new(),
+                 mem_file_path: PathBuf::new(),
++                live_max_bytes: None,
+             },
+         )));
+         #[cfg(target_arch = "x86_64")]
+diff --git a/src/vmm/src/vmm_config/snapshot.rs b/src/vmm/src/vmm_config/snapshot.rs
+index 4f312f8..6e41173 100644
+--- a/src/vmm/src/vmm_config/snapshot.rs
++++ b/src/vmm/src/vmm_config/snapshot.rs
+@@ -15,6 +15,13 @@ use serde::{Deserialize, Serialize};
+ pub enum SnapshotType {
+     /// Diff snapshot.
+     Diff,
++    /// Diff snapshot of guest memory only, taken without pausing the vCPUs —
++    /// a pre-copy round for live migration. No vCPU/device state is saved
++    /// (`snapshot_path` is ignored). Dumps at most `live_max_bytes` (when
++    /// set); dirty pages beyond the cap stay tracked in the VMM dirty
++    /// bitmap as a backlog that subsequent calls drain. Requires
++    /// `track_dirty_pages`.
++    DiffLive,
+     /// Full snapshot.
+     #[default]
+     Full,
+@@ -45,6 +52,13 @@ pub struct CreateSnapshotParams {
+     pub snapshot_path: PathBuf,
+     /// Path to the file that will contain the guest memory.
+     pub mem_file_path: PathBuf,
++    /// For [`SnapshotType::DiffLive`] only: cap on how many bytes of guest
++    /// memory this call may dump. Dirty pages beyond the cap stay marked
++    /// dirty and are returned by subsequent calls. Because a live dump runs
++    /// on the VMM event loop — which also services device emulation — this
++    /// bounds how long one call can stall guest I/O.
++    #[serde(default)]
++    pub live_max_bytes: Option<u64>,
+ }
+ 
+ /// Allows for changing the mapping between tap devices and host devices
+diff --git a/src/vmm/src/vstate/memory.rs b/src/vmm/src/vstate/memory.rs
+index 7bff6ad..80bdf4e 100644
+--- a/src/vmm/src/vstate/memory.rs
++++ b/src/vmm/src/vstate/memory.rs
+@@ -144,6 +144,21 @@ impl<'a> GuestMemorySlot<'a> {
+         writer: &mut T,
+         kvm_bitmap: &[u64],
+         page_size: usize,
++    ) -> Result<(), MemoryError> {
++        self.dump_dirty_budgeted(writer, kvm_bitmap, page_size, None)
++    }
++
++    /// Dumps the dirty pages in this slot onto the writer, up to `budget.0`
++    /// bytes. Dirty pages beyond the budget are recorded in the `budget.1`
++    /// leftover bitmap instead of dumped, so the caller can keep them
++    /// tracked for a subsequent call — this is what bounds how long one
++    /// live snapshot call can occupy the VMM event loop.
++    pub(crate) fn dump_dirty_budgeted<T: WriteVolatile + std::io::Seek>(
++        &self,
++        writer: &mut T,
++        kvm_bitmap: &[u64],
++        page_size: usize,
++        mut budget: Option<(&mut u64, &mut [u64])>,
+     ) -> Result<(), MemoryError> {
+         let firecracker_bitmap = self.slice.bitmap();
+         let mut write_size = 0;
+@@ -175,7 +190,23 @@ impl<'a> GuestMemorySlot<'a> {
+                     break;
+                 }
+ 
+-                if is_kvm_page_dirty || is_firecracker_page_dirty {
++                let mut include = is_kvm_page_dirty || is_firecracker_page_dirty;
++                if include {
++                    if let Some((remaining, leftover)) = budget.as_mut() {
++                        if **remaining >= page_size as u64 {
++                            **remaining -= page_size as u64;
++                        } else {
++                            // Over budget: record the page for the next call.
++                            // (KVM's bit was consumed by the fetch, so it
++                            // must be preserved somewhere or it would be
++                            // lost.)
++                            leftover[i] |= 1u64 << j;
++                            include = false;
++                        }
++                    }
++                }
++
++                if include {
+                     // We are at the start of a new batch of dirty pages.
+                     if skip_size > 0 {
+                         // Seek forward over the unmodified pages.
+@@ -622,6 +653,22 @@ where
+         dirty_bitmap: &DirtyBitmap,
+     ) -> Result<(), MemoryError>;
+ 
++    /// Like [`Self::dump_dirty`], but safe to call while vCPUs are running
++    /// (a live-migration pre-copy round): the VMM-internal dirty bitmap is
++    /// preserved instead of reset, and at most `max_bytes` of memory are
++    /// dumped per call (dirty pages beyond the cap stay marked for the next
++    /// call).
++    fn dump_dirty_live<T: WriteVolatile + std::io::Seek>(
++        &self,
++        writer: &mut T,
++        dirty_bitmap: &DirtyBitmap,
++        max_bytes: Option<u64>,
++    ) -> Result<(), MemoryError>;
++
++    /// Returns how many bytes are currently marked dirty in the VMM-internal
++    /// bitmaps — the backlog a budgeted live dump still has to drain.
++    fn dirty_backlog_bytes(&self) -> u64;
++
+     /// Resets all the memory region bitmaps
+     fn reset_dirty(&self);
+ 
+@@ -720,25 +767,7 @@ impl GuestMemoryExtension for GuestMemoryMmap {
+         dirty_bitmap: &DirtyBitmap,
+     ) -> Result<(), MemoryError> {
+         let page_size = host_page_size();
+-
+-        let write_result =
+-            self.iter()
+-                .flat_map(|region| region.slots())
+-                .try_for_each(|(mem_slot, plugged)| {
+-                    if !plugged {
+-                        let ilen = i64::try_from(mem_slot.slice.len())
+-                            .map_err(|_| MemoryError::SlotSizeTooLarge)?;
+-                        writer
+-                            .seek(SeekFrom::Current(ilen))
+-                            .map_err(MemoryError::SeekError)?;
+-                    } else {
+-                        let kvm_bitmap = dirty_bitmap
+-                            .get(&mem_slot.slot)
+-                            .ok_or(MemoryError::DirtyBitmapNotFound(mem_slot.slot))?;
+-                        mem_slot.dump_dirty(writer, kvm_bitmap, page_size)?;
+-                    }
+-                    Ok(())
+-                });
++        let write_result = dump_dirty_pages(self, writer, dirty_bitmap, page_size, None);
+ 
+         if write_result.is_err() {
+             self.store_dirty_bitmap(dirty_bitmap, page_size);
+@@ -749,6 +778,79 @@ impl GuestMemoryExtension for GuestMemoryMmap {
+         write_result
+     }
+ 
++    /// Like [`Self::dump_dirty`], but safe to call while vCPUs are running
++    /// (a live-migration pre-copy round), and bounded: at most `max_bytes`
++    /// of memory are dumped per call.
++    ///
++    /// Dirty pages beyond the budget are not lost — they are collected into
++    /// a leftover bitmap, and after the dump the VMM-internal bitmap is
++    /// reset and re-marked with exactly that leftover. The bitmap therefore
++    /// doubles as the drain backlog: each call dumps up to `max_bytes` of
++    /// it and the backlog shrinks monotonically (modulo new writes). An
++    /// earlier design that merely re-marked over-budget pages without the
++    /// reset never converged: the backlog stayed in the bitmap forever, so
++    /// every round re-dumped the same pages and re-write-protected the
++    /// whole backlog via the next dirty-log fetch, throttling the guest.
++    ///
++    /// Safety of read-then-reset: VMM-side guest-memory writes (virtio
++    /// queue processing, MMDS) are executed by the same event-loop thread
++    /// that runs this dump, so no VMM mark can race the reset. Guest (vCPU)
++    /// writes are covered by KVM's fetch-and-clear dirty log: a write
++    /// racing this dump lands either in the bitmap fetched for this round —
++    /// its page is dumped below, possibly torn mid-write — or in KVM's
++    /// fresh bitmap, so the page is re-dumped next round. Torn pages are
++    /// therefore always re-marked dirty, and the final paused pass is
++    /// consistent.
++    fn dump_dirty_live<T: WriteVolatile + std::io::Seek>(
++        &self,
++        writer: &mut T,
++        dirty_bitmap: &DirtyBitmap,
++        max_bytes: Option<u64>,
++    ) -> Result<(), MemoryError> {
++        let page_size = host_page_size();
++        let mut remaining = max_bytes.unwrap_or(u64::MAX);
++        let mut leftover = DirtyBitmap::new();
++        let write_result = dump_dirty_pages(
++            self,
++            writer,
++            dirty_bitmap,
++            page_size,
++            Some((&mut remaining, &mut leftover)),
++        );
++
++        match write_result {
++            Ok(()) => {
++                // Every dirty page was either dumped or recorded in
++                // `leftover`; the bitmap now tracks exactly the backlog.
++                self.reset_dirty();
++                self.store_dirty_bitmap(&leftover, page_size);
++            }
++            Err(_) => {
++                // The KVM bits were consumed by the fetch; merge them back
++                // so a later snapshot still sees these pages (same recovery
++                // as dump_dirty).
++                self.store_dirty_bitmap(dirty_bitmap, page_size);
++            }
++        }
++
++        write_result
++    }
++
++    fn dirty_backlog_bytes(&self) -> u64 {
++        let page_size = host_page_size();
++        self.iter()
++            .flat_map(|region| region.plugged_slots())
++            .map(|mem_slot| {
++                let bitmap = mem_slot.slice.bitmap();
++                (0..mem_slot.slice.len())
++                    .step_by(page_size)
++                    .filter(|&off| bitmap.dirty_at(off))
++                    .count() as u64
++                    * page_size as u64
++            })
++            .sum()
++    }
++
+     /// Resets all the memory region bitmaps
+     fn reset_dirty(&self) {
+         self.iter().for_each(|region| {
+@@ -824,6 +926,49 @@ impl GuestMemoryExtension for GuestMemoryMmap {
+     }
+ }
+ 
++/// Writes every page marked dirty in either the KVM bitmap or the
++/// VMM-internal bitmap to `writer`, seeking over clean pages so the output
++/// stays sparse. Shared by [`GuestMemoryExtension::dump_dirty`] and
++/// [`GuestMemoryExtension::dump_dirty_live`], which differ in their bitmap
++/// bookkeeping afterwards and in whether they cap the dump with a budget.
++fn dump_dirty_pages<T: WriteVolatile + std::io::Seek>(
++    mem: &GuestMemoryMmap,
++    writer: &mut T,
++    dirty_bitmap: &DirtyBitmap,
++    page_size: usize,
++    mut live_budget: Option<(&mut u64, &mut DirtyBitmap)>,
++) -> Result<(), MemoryError> {
++    mem.iter()
++        .flat_map(|region| region.slots())
++        .try_for_each(|(mem_slot, plugged)| {
++            if !plugged {
++                let ilen = i64::try_from(mem_slot.slice.len())
++                    .map_err(|_| MemoryError::SlotSizeTooLarge)?;
++                writer
++                    .seek(SeekFrom::Current(ilen))
++                    .map_err(MemoryError::SeekError)?;
++            } else {
++                let kvm_bitmap = dirty_bitmap
++                    .get(&mem_slot.slot)
++                    .ok_or(MemoryError::DirtyBitmapNotFound(mem_slot.slot))?;
++                match live_budget.as_mut() {
++                    None => mem_slot.dump_dirty(writer, kvm_bitmap, page_size)?,
++                    Some((remaining, leftover)) => {
++                        let mut slot_leftover = vec![0u64; kvm_bitmap.len()];
++                        mem_slot.dump_dirty_budgeted(
++                            writer,
++                            kvm_bitmap,
++                            page_size,
++                            Some((&mut **remaining, slot_leftover.as_mut_slice())),
++                        )?;
++                        leftover.insert(mem_slot.slot, slot_leftover);
++                    }
++                }
++            }
++            Ok(())
++        })
++}
++
+ fn create_memfd(
+     mem_size: u64,
+     hugetlb_size: Option<memfd::HugetlbSize>,
+@@ -1325,6 +1470,110 @@ mod tests {
+         ));
+     }
+ 
++    #[test]
++    fn test_dump_dirty_live_drains_bitmap() {
++        let page_size = host_page_size();
++
++        // Two regions of two pages each, with a one page gap between them.
++        let region_1_address = GuestAddress(0);
++        let region_2_address = GuestAddress(page_size as u64 * 3);
++        let region_size = page_size * 2;
++        let mem_regions = [
++            (region_1_address, region_size),
++            (region_2_address, region_size),
++        ];
++        let guest_memory = into_region_ext(
++            anonymous(mem_regions.into_iter(), true, HugePageConfig::None).unwrap(),
++        );
++
++        // Dirty every page in the firecracker bitmap via regular writes.
++        guest_memory
++            .write(&vec![1u8; region_size], region_1_address)
++            .unwrap();
++        guest_memory
++            .write(&vec![2u8; region_size], region_2_address)
++            .unwrap();
++
++        let mut kvm_dirty_bitmap: DirtyBitmap = HashMap::new();
++        kvm_dirty_bitmap.insert(0, vec![0b01]);
++        kvm_dirty_bitmap.insert(1, vec![0b10]);
++
++        // An unbudgeted live dump writes every page (all four are dirty in
++        // the firecracker bitmap) and fully drains the bitmap: everything
++        // dumped, no backlog.
++        let mut live_file = TempFile::new().unwrap().into_file();
++        guest_memory
++            .dump_dirty_live(&mut live_file, &kvm_dirty_bitmap, None)
++            .unwrap();
++        assert_eq!(
++            live_file.metadata().unwrap().blocks() * 512,
++            4 * page_size as u64
++        );
++        guest_memory.iter().for_each(|r| {
++            assert!(!r.bitmap().dirty_at(0));
++            assert!(!r.bitmap().dirty_at(page_size));
++        });
++    }
++
++    #[test]
++    fn test_dump_dirty_live_budget() {
++        let page_size = host_page_size();
++
++        // One region, four pages, all dirty in the firecracker bitmap.
++        let region_size = page_size * 4;
++        let guest_memory = into_region_ext(
++            anonymous(
++                [(GuestAddress(0), region_size)].into_iter(),
++                true,
++                HugePageConfig::None,
++            )
++            .unwrap(),
++        );
++        guest_memory
++            .write(&vec![7u8; region_size], GuestAddress(0))
++            .unwrap();
++        let mut kvm_dirty_bitmap: DirtyBitmap = HashMap::new();
++        kvm_dirty_bitmap.insert(0, vec![0b0000]);
++
++        // Budget of two pages: the dump must contain exactly two pages of
++        // data, drain those two from the bitmap, and keep the other two
++        // marked as backlog.
++        let mut file = TempFile::new().unwrap().into_file();
++        guest_memory
++            .dump_dirty_live(&mut file, &kvm_dirty_bitmap, Some(2 * page_size as u64))
++            .unwrap();
++        assert_eq!(
++            file.metadata().unwrap().blocks() * 512,
++            2 * page_size as u64
++        );
++        guest_memory.iter().for_each(|r| {
++            assert!(!r.bitmap().dirty_at(0));
++            assert!(!r.bitmap().dirty_at(page_size));
++            assert!(r.bitmap().dirty_at(2 * page_size));
++            assert!(r.bitmap().dirty_at(3 * page_size));
++        });
++        assert_eq!(
++            guest_memory.dirty_backlog_bytes(),
++            2 * page_size as u64,
++            "backlog accounting should match the two undumped pages"
++        );
++
++        // A follow-up with a clean KVM bitmap drains exactly the backlog.
++        let mut clean_kvm: DirtyBitmap = HashMap::new();
++        clean_kvm.insert(0, vec![0b0000]);
++        let mut file2 = TempFile::new().unwrap().into_file();
++        guest_memory
++            .dump_dirty_live(&mut file2, &clean_kvm, None)
++            .unwrap();
++        assert_eq!(
++            file2.metadata().unwrap().blocks() * 512,
++            2 * page_size as u64
++        );
++        guest_memory
++            .iter()
++            .for_each(|r| assert!(!r.bitmap().dirty_at(3 * page_size)));
++    }
++
+     #[test]
+     fn test_store_dirty_bitmap() {
+         let page_size = host_page_size();
+diff --git a/src/vmm/src/vstate/vm.rs b/src/vmm/src/vstate/vm.rs
+index 4ba4bdc..a56ff23 100644
+--- a/src/vmm/src/vstate/vm.rs
++++ b/src/vmm/src/vstate/vm.rs
+@@ -572,6 +572,7 @@ impl KvmVm {
+         &self,
+         mem_file_path: &Path,
+         snapshot_type: SnapshotType,
++        live_max_bytes: Option<u64>,
+     ) -> Result<(), CreateSnapshotError> {
+         use self::CreateSnapshotError::*;
+ 
+@@ -617,6 +618,29 @@ impl KvmVm {
+                 let dirty_bitmap = self.get_dirty_bitmap()?;
+                 self.guest_memory().dump_dirty(&mut file, &dirty_bitmap)?;
+             }
++            SnapshotType::DiffLive => {
++                // A live round is only sound with KVM dirty-page tracking:
++                // the mincore() fallback measures page residency, not guest
++                // writes, and cannot be cleared between rounds, so pre-copy
++                // would degenerate into repeated full copies.
++                if self
++                    .guest_memory()
++                    .iter()
++                    .any(|region| region.bitmap().is_none())
++                {
++                    return Err(DirtyPageTrackingRequired);
++                }
++                // Fetch KVM's dirty log every round so each round sees the
++                // true remaining dirty set: last round's over-budget backlog
++                // (preserved in the VMM bitmap) OR'd with new guest writes.
++                // The dump ships up to live_max_bytes of it and re-records
++                // the rest as backlog, so the residual shrinks monotonically
++                // whenever the guest dirties less than the budget per round —
++                // which is what makes a budgeted drain converge.
++                let dirty_bitmap = self.get_dirty_bitmap()?;
++                self.guest_memory()
++                    .dump_dirty_live(&mut file, &dirty_bitmap, live_max_bytes)?;
++            }
+             SnapshotType::Full => {
+                 self.guest_memory().dump(&mut file)?;
+                 self.reset_dirty_bitmap();
+diff --git a/src/vmm/tests/integration_tests.rs b/src/vmm/tests/integration_tests.rs
+index 45bc330..75f76b4 100644
+--- a/src/vmm/tests/integration_tests.rs
++++ b/src/vmm/tests/integration_tests.rs
+@@ -246,6 +246,7 @@ fn verify_create_snapshot(
+         snapshot_type,
+         snapshot_path: snapshot_file.as_path().to_path_buf(),
+         mem_file_path: memory_file.as_path().to_path_buf(),
++        live_max_bytes: None,
+     };
+ 
+     controller
+-- 
+2.55.0
+
