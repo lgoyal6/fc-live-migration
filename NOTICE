@@ -1,0 +1,15 @@
+fc-live-migration
+Copyright 2026 Laksh Goyal
+
+This project is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+------------------------------------------------------------------------------
+Firecracker
+
+patches/0001-vmm-add-DiffLive-snapshot-type-for-live-migration-pr.patch is a
+derivative work of Firecracker (https://github.com/firecracker-microvm/
+firecracker), Copyright Amazon.com, Inc. or its affiliates, licensed under the
+Apache License, Version 2.0. The patch applies to Firecracker v1.16.1 and is
+distributed under the same license. Firecracker itself is not vendored in this
+repository; scripts/setup-host.sh clones it at build time and applies the
+patch.
