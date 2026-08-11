@@ -71,14 +71,18 @@ $ make hostile  # crank the guest's dirty rate, watch auto-converge
 `make demo` output (one run, on the laptop under nested virt):
 
 ```
-agent-reported blackout :    21.94 ms  (pause → resume on target)
-client-observed blackout:   121.79 ms  (longest run of probes never answered)
-guest integrity         : 0 errors over 49005 pages verified
+agent  pause→resume    :    15.67 ms  (VM provably not executing)
+client bracketing probe:   371.27 ms  (unanswered run overlapping pause→resume)
+guest integrity        : 0 errors over 65284 pages verified
+blackout budget 30ms → FAIL
 ```
 
-The agent figure is the downtime; the client figure on this hardware is
-dominated by the nested-virtualization jitter floor described below — on
-bare metal the two converge.
+The agent figure is the downtime, and it meets the budget. The client figure
+does not, and `fcprobe` reports the stricter of the two, so the laptop prints
+`FAIL` — that is accurate and deliberately left in. The difference between
+the two is the post-restore fault-in tail explained under
+[Measured](#measured); it is a property of running this nested on a laptop,
+not of the migration itself.
 
 ## Layout
 
@@ -127,7 +131,8 @@ whenever the host has CPU to give. It is immune to *guest*-level jitter, but
 not to host starvation: pause→resume is wall-clock time that includes
 host-scheduled work, so on a laptop swapping hard (load 6+, 12% free RAM) the
 same build reported 180 ms. Quiesce the host before believing any number here.
-The client-observed number is larger — ~180–320 ms — and that gap is real
+The client-observed number is larger — ~180–600 ms, scaling with the number
+of pre-copy rounds — and that gap is real
 rather than noise: probed at rest with no migration in flight, this guest
 goes unanswered for at most ~13 ms. It is the post-restore fault-in tail. The
 VM has already resumed, but its RAM is a file it hasn't touched yet, and

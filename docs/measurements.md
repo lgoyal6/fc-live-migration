@@ -57,7 +57,8 @@ usual desktop apps. Two consequences dominate the *client-side* numbers here:
   ~65k faults, and the arithmetic lands where the measurement does: the VM is
   *executing* (the agent's pause→resume already ended, at 8–18 ms) but is too
   busy wiring up its own memory to service virtio, so the client sees no
-  replies for ~180–320 ms.
+  replies for ~180–600 ms — the spread tracks how many pre-copy rounds ran,
+  since each round's dump contends with virtio.
 
   It would be convenient to blame an ambient jitter floor, so that hypothesis
   was tested directly — `fcprobe probe` for 5 s with no migration in flight,
@@ -92,7 +93,7 @@ after.
 
 Stated plainly, because it is the one number a reader should not have to dig
 for: **on this hardware the stop-the-world window is 8–18 ms and meets the
-budget, while the client-observed switchover gap is ~180–320 ms and does
+budget, while the client-observed switchover gap is ~180–600 ms and does
 not.** `fcprobe` reports the stricter of the two, so `make demo` on a laptop
 prints `blackout budget 30ms → FAIL`. That verdict is correct and deliberately
 not softened; the tool is meant to be adversarial about its own project.
