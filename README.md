@@ -71,9 +71,9 @@ $ make hostile  # crank the guest's dirty rate, watch auto-converge
 `make demo` output (one run, on the laptop under nested virt):
 
 ```
-agent  pause→resume    :    15.67 ms  (VM provably not executing)
-client bracketing probe:   371.27 ms  (unanswered run overlapping pause→resume)
-guest integrity        : 0 errors over 65284 pages verified
+agent  pause→resume    :    12.22 ms  (VM provably not executing)
+client bracketing probe:   377.07 ms  (unanswered run overlapping pause→resume)
+guest integrity        : 0 errors over 61952 pages verified
 blackout budget 30ms → FAIL
 ```
 
