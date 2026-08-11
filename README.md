@@ -120,8 +120,12 @@ TCP session            :    survives  (no reconnect across the host switch)
 ```
 
 The **agent-measured** blackout — recorded inside the VMM around the actual
-KVM pause/resume — is the trustworthy figure and is consistently within the
-30 ms budget. The client-side probe number carries this environment's ~25 ms
+KVM pause/resume — is the trustworthy figure and sits within the 30 ms budget
+whenever the host has CPU to give. It is immune to *guest*-level jitter, but
+not to host starvation: pause→resume is wall-clock time that includes
+host-scheduled work, so on a laptop swapping hard (load 6+, 12% free RAM) the
+same build reported 180 ms. Quiesce the host before believing any number here.
+The client-side probe number additionally carries this environment's ~25 ms
 nested-virtualization jitter floor (the guest vCPU stalls that long even at
 rest, with no migration), so a *clean* client-observed sub-30 ms result must
 be taken on non-nested hardware, where the two numbers converge. See
@@ -135,12 +139,21 @@ brownout accounting, and why the laptop and bare-metal numbers differ.
   delayed, because the memory dump shares the VMM event-loop thread with the
   virtio device — ~10× amplified under nested virt. Fix: run the dump on a
   separate thread (the guest memory is `Arc`-shared) — noted as future work.
-- **Repeated rapid ping-pong.** Migrating the same guest back and forth every
-  few seconds eventually panics the *guest kernel* (in interrupt handling,
-  memory content verified intact) — most likely aarch64 timer/GIC state after
-  many restores in quick succession. Single migrations, and migrations spaced
-  normally apart, are robust; `make bench` reboots a fresh guest if one tires
-  so the distribution still completes.
+- **Guest kernel panic on restore, under host starvation.** The guest can
+  panic on the *target* just after restore — always in the timer softirq path
+  (`call_timer_fn` → `__run_timers` → `run_timer_softirq`), memory content
+  verified intact. Two measurements narrow it down. It is **not** the
+  `DiffLive` patch: six fresh-boot migrations with `live_rounds=false` (stock
+  paused diff, no patch in the path) failed at the same rate as six with it
+  enabled — see [docs/measurements.md](docs/measurements.md#isolating-the-restore-panic).
+  And it tracks *host* load rather than migration count: on a laptop swapping
+  hard (load 6+, 12% free RAM) it hit 5 of 6 migrations, while the same build
+  on an unloaded host migrates cleanly. That is consistent with aarch64
+  timer/GIC state after a restore the host failed to schedule promptly. The
+  failure is safe rather than lossy: the migration returns an error, rollback
+  leaves the source authoritative, and the guest keeps serving — and `make
+  bench` reclaims the slot (`DELETE /vms/{id}`) and reboots a fresh guest so
+  the distribution still completes.
 - **Post-copy tail** (serve residual pages over the network for a near-zero
   final round) is designed-for but not implemented — the natural next step.
 

@@ -61,7 +61,17 @@ usual desktop apps. Two consequences dominate the *client-side* numbers here:
 
 The **agent-reported** blackout is immune to both — it is measured inside the
 VMM around the actual pause/resume — which is why it stays clean (~8–25 ms)
-regardless of host load. On non-nested KVM (a bare-metal box), the jitter
+across the *guest*-level jitter above.
+
+It is not, however, immune to starvation of the host itself. Pause→resume is
+wall-clock time, and the work inside that window (the final diff, the
+snapshot load on the target) runs on threads the host must schedule. On a
+laptop that had gone into heavy swap — load average 6.4, 12% free memory,
+1.6M pageouts — the same build reported a **180 ms** agent blackout, an order
+of magnitude off its own baseline of 21.9 ms measured hours earlier on the
+same machine. No number in this document means anything if the host is
+thrashing; check `uptime` and free memory before a measurement run, not
+after. On non-nested KVM (a bare-metal box), the jitter
 floor and the dump amplification both vanish, and the client-observed number
 converges to the agent number. The definitive figures should therefore be
 taken on real hardware; this repo runs identically there
@@ -97,12 +107,68 @@ reflects the migration mechanism and which reflects the environment. On
 non-nested hardware, spaced-apart migrations, the client number tracks the
 agent number and this drift does not appear.
 
+## Isolating the restore panic
+
+The guest sometimes panics on the *target* immediately after restore, always
+in the same place — the timer softirq:
+
+```
+lr : call_timer_fn.constprop.0+0x24/0x80
+Call trace: __run_timers → run_timer_softirq → handle_softirqs
+Kernel panic - not syncing: Oops: Fatal exception in interrupt
+```
+
+The obvious suspect is the `DiffLive` patch: if a pause-free dump lost a
+guest write, the target would restore a torn image and die on the first
+kernel structure it touched. That hypothesis is testable, because the agent
+can run the same pre-copy with stock *paused* diff snapshots (`LIVE_ROUNDS=false`),
+which takes the patch out of the data path while leaving every other moving
+part — the sparse wire protocol, the memory file assembly, the restore, the
+GARP — identical.
+
+Six trials per arm, each a freshly booted guest migrated once host-a → host-b,
+with the target's console log wiped between trials so a stale panic cannot be
+counted twice:
+
+| Arm | Pass | Target kernel panic | Other failure |
+|---|---:|---:|---:|
+| `live_rounds=true` (DiffLive patch) | 1 | 2 | 3 |
+| `live_rounds=false` (stock paused diff) | 1 | 4 | 1 |
+
+**The patch is not the cause.** Disabling it does not improve the failure
+rate; if anything the confirmed-panic count is higher. What *does* correlate
+is host load — this run was taken on a laptop in heavy swap (see the host
+starvation note above), and the same build on an unloaded host migrates
+cleanly. The working hypothesis is therefore aarch64 timer/GIC state after a
+restore the host was too starved to schedule promptly, not memory corruption
+in pre-copy — consistent with `integrity_errors` never once going nonzero,
+across every arm, including the runs that panicked.
+
+Worth stating plainly: the guest's scribbler verifies its own buffer
+(`scrib_buf_mb`, 32 MiB of a 256 MiB guest), not the kernel's own pages, so a
+clean `integrity_errors` is strong evidence but not a proof that no kernel
+page was ever disturbed. The A/B above is the load-bearing result, because it
+holds the memory path fixed and varies only the snapshot primitive.
+
+The failure mode is safe rather than lossy. The migration returns an error,
+the rollback path leaves the source authoritative, and the guest keeps
+serving from the host it started on — verified reachable from the client and
+from both host containers after every failed trial.
+
 ## Reproducing
 
 ```console
 $ make bench N=50        # 50 ping-pong migrations
 $ make plot              # bench-results/histogram.png
 $ make hostile MBPS=400  # auto-converge under a hostile dirty rate
+```
+
+To reproduce the A/B above, bring the agents up with the patch out of the
+data path and repeat the same migrations:
+
+```console
+$ LIVE_ROUNDS=false docker compose -f deploy/docker-compose.yml up -d
+$ docker compose -f deploy/docker-compose.yml logs host-a | grep live_rounds
 ```
 
 Each migration's per-phase timeline (`migrate.start`, `base.sent`,
