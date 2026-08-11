@@ -50,11 +50,26 @@ The development environment is Docker-in-Lima-in-macOS on Apple Silicon: the
 guest is a VM (Firecracker) inside a VM (Lima) on a laptop also running the
 usual desktop apps. Two consequences dominate the *client-side* numbers here:
 
-- **A jitter floor.** With no migration running at all, the guest still drops
-  ~25 ms of probes at a time — the guest vCPU thread simply isn't scheduled
-  for tens of ms under nested virt on a loaded host. That noise floor sits
-  right at the 30 ms budget, so a clean client-observed blackout cannot be
-  measured on this hardware.
+- **A post-restore fault-in tail.** This is the big one, and it is *not*
+  measurement noise. After the target resumes, the guest's RAM is a file it
+  has not touched yet; every first access takes a stage-2 fault, and nested
+  virt makes each one roughly 10× more expensive. For a 256 MiB guest that is
+  ~65k faults, and the arithmetic lands where the measurement does: the VM is
+  *executing* (the agent's pause→resume already ended, at 8–18 ms) but is too
+  busy wiring up its own memory to service virtio, so the client sees no
+  replies for ~180–320 ms.
+
+  It would be convenient to blame an ambient jitter floor, so that hypothesis
+  was tested directly — `fcprobe probe` for 5 s with no migration in flight,
+  three times:
+
+  ```
+  lostrun=1.00ms  |  lostrun=0.00ms  |  lostrun=12.70ms
+  ```
+
+  At rest the guest never goes unanswered for more than ~13 ms. The switchover
+  gap is therefore caused by the migration, not by the environment being
+  noisy — the environment only sets its *size*.
 - **~10× slower VMM operations.** Each `KVM_GET_DIRTY_LOG` and each page dump
   traps to the L0 hypervisor, so dumps that cost <1 ms on bare metal cost
   several ms here, deepening the pre-copy brownout.
@@ -71,11 +86,30 @@ laptop that had gone into heavy swap — load average 6.4, 12% free memory,
 of magnitude off its own baseline of 21.9 ms measured hours earlier on the
 same machine. No number in this document means anything if the host is
 thrashing; check `uptime` and free memory before a measurement run, not
-after. On non-nested KVM (a bare-metal box), the jitter
-floor and the dump amplification both vanish, and the client-observed number
-converges to the agent number. The definitive figures should therefore be
-taken on real hardware; this repo runs identically there
-(`make setup && make up && make bench` on any Linux host with `/dev/kvm`).
+after.
+
+### What this means for the 30 ms budget
+
+Stated plainly, because it is the one number a reader should not have to dig
+for: **on this hardware the stop-the-world window is 8–18 ms and meets the
+budget, while the client-observed switchover gap is ~180–320 ms and does
+not.** `fcprobe` reports the stricter of the two, so `make demo` on a laptop
+prints `blackout budget 30ms → FAIL`. That verdict is correct and deliberately
+not softened; the tool is meant to be adversarial about its own project.
+
+The two numbers measure different things. The agent figure is downtime in the
+live-migration sense — the VM provably not executing — which is what the
+technique is judged on and what the patch exists to shrink. The client figure
+additionally contains the fault-in tail above, during which the VM *is*
+running and simply cannot answer yet.
+
+On non-nested KVM the dump amplification and the per-fault cost both drop by
+roughly an order of magnitude, which is the basis for expecting the two
+numbers to converge there. That expectation is **untested** — every figure in
+this document was taken under nested virtualization, and the honest status of
+the bare-metal claim is "predicted, not measured." Running
+`make setup && make up && make bench` on any Linux host with `/dev/kvm` is
+what would settle it, and is the first thing worth doing with real hardware.
 
 ## Results
 

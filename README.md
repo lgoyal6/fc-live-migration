@@ -111,12 +111,14 @@ bare metal the two converge.
   bounces the VM A→B→A→… without ever re-sending a full copy cold.
 ## Measured
 
-A single live migration on the laptop (nested virt, 128–256 MiB guest):
+Four consecutive migrations on the laptop (nested virt, 256 MiB guest), one
+after another on a quiesced host:
 
 ```
-agent  pause→resume    :   ~8–25 ms   (VM provably not executing — the true downtime)
-guest integrity        :    0 errors  (millions of self-verified pages, every run)
-TCP session            :    survives  (no reconnect across the host switch)
+agent  pause→resume    :  7.9 / 13.6 / 17.5 / 17.7 ms   (VM provably not executing)
+guest integrity        :  0 errors, every run           (self-verified pages)
+guest survival         :  4 / 4                         (TCP session intact across each switch)
+client switchover gap  :  179-324 ms                    (see the fault-in tail below)
 ```
 
 The **agent-measured** blackout — recorded inside the VMM around the actual
@@ -125,10 +127,16 @@ whenever the host has CPU to give. It is immune to *guest*-level jitter, but
 not to host starvation: pause→resume is wall-clock time that includes
 host-scheduled work, so on a laptop swapping hard (load 6+, 12% free RAM) the
 same build reported 180 ms. Quiesce the host before believing any number here.
-The client-side probe number additionally carries this environment's ~25 ms
-nested-virtualization jitter floor (the guest vCPU stalls that long even at
-rest, with no migration), so a *clean* client-observed sub-30 ms result must
-be taken on non-nested hardware, where the two numbers converge. See
+The client-observed number is larger — ~180–320 ms — and that gap is real
+rather than noise: probed at rest with no migration in flight, this guest
+goes unanswered for at most ~13 ms. It is the post-restore fault-in tail. The
+VM has already resumed, but its RAM is a file it hasn't touched yet, and
+under nested virt each of those ~65k first-touch faults costs ~10× what it
+would on bare metal, so the guest is executing without being able to answer.
+Because `fcprobe` reports the stricter of the two figures, `make demo` on a
+laptop prints `blackout budget 30ms → FAIL` — accurate, and left unsoftened.
+Bare metal is expected to collapse that tail and converge the two numbers;
+that expectation is predicted, not yet measured. See
 [docs/measurements.md](docs/measurements.md) for the methodology, the honest
 brownout accounting, and why the laptop and bare-metal numbers differ.
 
