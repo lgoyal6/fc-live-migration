@@ -49,13 +49,23 @@ streams over the dedicated migration network, pre-copy rounds shrink the dirty
 set, then one short pause, restore on host-b, gratuitous ARP. The counter
 stream on the left never breaks.
 
-**1:05–1:20 — The number.** Freeze on fcprobe's output:
+**1:05–1:20 — The number, and the asterisk.** Freeze on fcprobe's output:
 ```
-agent  pause→resume    :   ~10 ms   (VM provably not executing)
-client bracketing probe:   <30 ms   (on bare metal)
-guest integrity        :    0 errors
+agent  pause→resume    :  7.9-17.7 ms  (VM provably not executing)
+client bracketing probe:  179-324 ms   (fault-in tail — see below)
+guest integrity        :  0 errors
+blackout budget 30ms → FAIL
 ```
-"Ten milliseconds of blackout. The TCP session survived. Zero corrupted pages."
+"Eight milliseconds of blackout — the VM provably not executing. TCP session
+survived, zero corrupted pages."
+
+Then take the `FAIL` head-on, in one breath — do not let a viewer find it
+first: "My own prober fails me on the client-side number, and that's honest.
+That 200 ms isn't the pause — the VM is already running. It's the guest
+faulting 256 MB of RAM back in, and every one of those 65,000 faults costs
+about ten times what it would on real hardware, because this is a VM inside a
+VM on a laptop. I probed it idle to rule out noise: 13 ms. On bare metal that
+tail should collapse — I didn't have bare metal, so I'm not claiming it."
 
 **1:20–1:40 — Why it works, in one sentence.** "The trick: dump dirty memory
 while the vCPUs keep running — a snapshot type Firecracker didn't have — so
