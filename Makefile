@@ -9,6 +9,7 @@
 REPO := $(CURDIR)
 UNAME := $(shell uname -s)
 GOARCH := $(shell go env GOARCH)
+GUEST ?= 172.30.0.50
 
 ifeq ($(UNAME),Darwin)
   RUN     := limactl shell --workdir $(REPO) fcmig --
@@ -18,7 +19,7 @@ else
   COMPOSE := docker compose -f $(REPO)/deploy/docker-compose.yml
 endif
 
-.PHONY: vm binaries setup up down demo bench hostile plot test clean
+.PHONY: vm binaries setup up down demo watch bench hostile plot test clean
 
 ## vm: (macOS only) create the nested-virt Linux VM; no-op on Linux
 vm:
@@ -49,6 +50,14 @@ down:
 ## demo: boot vm0 on host-a, then live-migrate it to host-b under probing
 demo: up
 	$(RUN) $(REPO)/scripts/run-demo.sh
+
+## watch: follow the guest's own view of itself — a counter that must keep
+## climbing and an integrity check that must stay at zero. Run this in a second
+## terminal during `make demo`: it is the guest saying, from inside, that the
+## migration never interrupted it. Ctrl-C to stop.
+watch:
+	$(COMPOSE) exec client sh -c \
+	  'while true; do curl -s http://$(GUEST):7780/status; echo; sleep 0.5; done'
 
 ## bench: N ping-pong migrations, blackout distribution (bench-results/)
 bench:

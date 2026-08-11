@@ -64,6 +64,7 @@ inside the Lima VM.
 $ make vm       # one-time: create the nested-virt Linux VM
 $ make setup    # build Firecracker v1.16.1 from source + patch, kernel, rootfs
 $ make demo     # boot vm0 on host-a, live-migrate to host-b under probing
+$ make watch    # in a second terminal: the guest's own counter + integrity check
 $ make bench    # N ping-pong migrations → bench-results/blackout.csv
 $ make hostile  # crank the guest's dirty rate, watch auto-converge
 ```
