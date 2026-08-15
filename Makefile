@@ -19,7 +19,7 @@ else
   COMPOSE := docker compose -f $(REPO)/deploy/docker-compose.yml
 endif
 
-.PHONY: vm binaries setup up down demo watch bench hostile plot test clean
+.PHONY: vm binaries setup up down demo watch migrate bench hostile plot test clean
 
 ## vm: (macOS only) create the nested-virt Linux VM; no-op on Linux
 vm:
@@ -58,6 +58,13 @@ demo: up
 watch:
 	$(COMPOSE) exec client sh -c \
 	  'while true; do curl -s http://$(GUEST):7780/status; echo; sleep 0.5; done'
+
+## migrate: live-migrate the VM that is already running to the other host, and
+## nothing else. `demo` resets the agents first, which necessarily kills the
+## running guest; this does not, so a `make watch` started beforehand streams
+## straight through the switchover. That continuity is the actual claim.
+migrate:
+	$(COMPOSE) exec -T client /opt/fcmig/fcprobe migrate
 
 ## bench: N ping-pong migrations, blackout distribution (bench-results/)
 bench:
