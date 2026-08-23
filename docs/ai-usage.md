@@ -23,18 +23,18 @@ honest account of the division of labour.
 
 - **The convergence bug.** The first budget implementation skipped the KVM
   dirty-log fetch while draining the backlog, to save TLB flushes. That
-  starved the drain of new dirty information and it never converged — 160+
+  starved the drain of new dirty information and it never converged - 160+
   rounds shipping the full budget forever. Diagnosing it required watching
   the per-round dirty sizes, not just trusting that "it migrated." The fix
   (fetch every round) was the opposite of the original optimization.
 - **The dirty-bitmap reset race.** The naïve `DiffLive` reused upstream
-  `dump_dirty`, which resets the VMM dirty bitmap on success — correct when
+  `dump_dirty`, which resets the VMM dirty bitmap on success - correct when
   paused, silent memory corruption when live. Catching this needed reasoning
   about which thread does VMM-side guest writes, not code generation.
 - **Reading the environment honestly.** Much iteration went into telling
-  apart "the mechanism is slow" from "the laptop is jittery." The conclusion —
+  apart "the mechanism is slow" from "the laptop is jittery." The conclusion  - 
   that the client-side numbers are dominated by a nested-virtualization jitter
-  floor, and the agent-side measurement is the trustworthy one — is a
+  floor, and the agent-side measurement is the trustworthy one - is a
   judgement call about *what to measure and believe*, informed by an ambient
   no-migration probe that showed ~25 ms gaps at rest.
 - **Scope calls.** Deciding to ship the brownout as documented rather than

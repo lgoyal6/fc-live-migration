@@ -7,21 +7,21 @@ in-kernel state (interrupt controller, timers), and emulated device state
 (virtio queues). Live migration moves all of it to another host while the
 guest keeps running, so a user of the guest sees at most a brief blip.
 
-Firecracker gives you the pieces to *stop* and move a VM — `PATCH /vm`
-(pause), `PUT /snapshot/create`, `PUT /snapshot/load` — but not to move it
+Firecracker gives you the pieces to *stop* and move a VM - `PATCH /vm`
+(pause), `PUT /snapshot/create`, `PUT /snapshot/load` - but not to move it
 live. The specific obstruction: **every snapshot requires paused vCPUs.** Not
 by an explicit check in the snapshot API, but because the vCPU state save
 (`save_state` → `VcpuEvent::SaveState`) answers `NotAllowed` unless the vCPU
 is in its paused state (`src/vmm/src/vstate/vcpu.rs`). So the textbook
-pre-copy algorithm — copy RAM while the guest runs, iterate on the pages it
-dirties, then stop only for a tiny final round — isn't expressible: each
+pre-copy algorithm - copy RAM while the guest runs, iterate on the pages it
+dirties, then stop only for a tiny final round - isn't expressible: each
 "copy RAM" step would have to pause first, and the pauses are the very thing
 pre-copy exists to avoid.
 
 ## The patch: `SnapshotType::DiffLive`
 
 The key observation (verified by reading the v1.16.1 source) is that the
-*memory dump* has no paused requirement — only the *vCPU/device state save*
+*memory dump* has no paused requirement - only the *vCPU/device state save*
 does. `Vm::snapshot_memory_to_file` takes `&self`, reads guest memory through
 `VolatileSlice`, and gets the dirty set from `KVM_GET_DIRTY_LOG`, which is
 explicitly designed to be called on a running VM. Only `create_snapshot`'s
@@ -45,7 +45,7 @@ Correctness has two halves:
   paused round is consistent. Torn pages are harmless precisely because they
   are never the *last* copy of that page.
 - **VMM-side writes (virtio RX, MMDS).** These run on the same event-loop
-  thread as the dump, so they cannot execute *during* it — no race to worry
+  thread as the dump, so they cannot execute *during* it - no race to worry
   about. But upstream's `dump_dirty` resets the VMM-internal dirty bitmap on
   success; doing that mid-migration would drop VMM writes that happened
   between the dump and a later round. So `dump_dirty_live` **preserves** that
@@ -57,7 +57,7 @@ Correctness has two halves:
 The dump runs on the event loop that also services virtio, so a large dump
 starves guest I/O. `DiffLive` takes a `live_max_bytes` budget: it dumps at
 most that many bytes, records the over-budget dirty pages back into the VMM
-bitmap, and returns. That bitmap is the **drain backlog** — the next call
+bitmap, and returns. That bitmap is the **drain backlog** - the next call
 fetches the KVM log again (picking up new guest writes), ORs in the backlog,
 dumps another budget's worth, and so on. Because the guest dirties less than
 a budget per round-cycle in the common case, the residual shrinks each round
@@ -74,18 +74,18 @@ suite unchanged.
 One agent per host owns the local Firecracker processes and speaks a small
 agent↔agent protocol. A migration, driven by the source:
 
-1. **prepare** — the target spawns a Firecracker process and opens its API
+1. **prepare** - the target spawns a Firecracker process and opens its API
    socket. Off the critical path, so its cost never touches the blackout.
-2. **base image** — the source streams a full memory image (the
+2. **base image** - the source streams a full memory image (the
    provision-time snapshot, or the image a previous migration left) to the
    target while the guest runs. Paced, over the dedicated migration network.
-3. **pre-copy drain** — rounds of `DiffLive`, each dumping the budget and
+3. **pre-copy drain** - rounds of `DiffLive`, each dumping the budget and
    streaming only the dirty extents (`SEEK_DATA`/`SEEK_HOLE`, so the wire cost
    is the dirty set, not RAM size). Loops until the residual is small or the
    guest is provably out-dirtying the drain (→ auto-converge).
-4. **settle** — stop dumping briefly so the guest returns to full-speed
+4. **settle** - stop dumping briefly so the guest returns to full-speed
    service, giving a clean boundary before the pause.
-5. **blackout** — `PATCH /vm Paused` → final `Diff` (residual dirty +
+5. **blackout** - `PATCH /vm Paused` → final `Diff` (residual dirty +
    vCPU/device state) → stream both → `PUT /snapshot/load` + resume on the
    target → gratuitous ARP. Then kill the source VM.
 
@@ -111,7 +111,7 @@ the guest keeps them on the target. On resume, the target agent broadcasts a
 **gratuitous ARP** with the guest's source MAC (`internal/agent/garp.go`, raw
 `AF_PACKET`); every bridge on the path moves the guest's forwarding entry to
 the new port, and in-flight TCP connections simply start arriving there. No
-proxy, no reconnect — the vMotion trick.
+proxy, no reconnect - the vMotion trick.
 
 ## Auto-converge
 
@@ -120,7 +120,7 @@ converges. Once the drain has run longer than the guest's whole memory would
 take at the transfer rate, the agent concludes the guest is out-running it and
 duty-cycles `SIGSTOP`/`SIGCONT` on the Firecracker **vCPU threads only**
 (`internal/agent/throttle.go`, found by their `fc_vcpu` thread names). The VMM
-event loop and the drain keep running at full speed — the guest slows, the
+event loop and the drain keep running at full speed - the guest slows, the
 dirty rate drops, the drain catches up. This is QEMU's vCPU-throttling
 auto-converge, implemented from the control plane instead of inside the VMM.
 `make hostile` demonstrates it against a guest scribbling memory at 400 MB/s.
@@ -128,8 +128,8 @@ auto-converge, implemented from the control plane instead of inside the VMM.
 ## Correctness instrumentation
 
 The guest (`cmd/guestd`) continuously rewrites a buffer of self-describing
-pages — each page's bytes are a deterministic keystream seeded by its own
-index and iteration counter — and verifies a sample every iteration. Any page
+pages - each page's bytes are a deterministic keystream seeded by its own
+index and iteration counter - and verifies a sample every iteration. Any page
 that is torn, stale, or lost anywhere in the migration pipeline fails
 verification and increments `integrity_errors`, which the prober reads after
 every migration. Across every run in this project that counter has stayed
