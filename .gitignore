@@ -10,3 +10,6 @@ bench-results/
 
 # Vendored Firecracker clone for patch development (built in the VM).
 third_party/
+
+# graphify knowledge graph (local index, not source)
+graphify-out/
